@@ -4,31 +4,24 @@ using System.Linq;
 using System.Security.Principal;
 using System.Threading;
 using System.Web;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using NewLife.Common;
-using NewLife.Cube.Extensions;
-using NewLife.Log;
 using NewLife.Model;
-using XCode.Membership;
-using IServiceCollection = Microsoft.Extensions.DependencyInjection.IServiceCollection;
+#if !__CORE__
+using System.Web.SessionState;
+#endif
 
-namespace NewLife.Cube
+namespace XCode.Membership
 {
-    /// <inheritdoc />
-    public class ManageProvider2 : ManageProvider
+    /// <summary>管理提供者</summary>
+    public class DefaultManageProvider : ManageProvider
     {
         #region 静态实例
-        static ManageProvider2()
-        {
-            // 此处实例化会触发父类静态构造函数
-            var ioc = ObjectContainer.Current;
-            ioc.Register<IManageProvider, ManageProvider2>()
-            .Register<IManageUser, UserX>();
-        }
-
-        internal static IHttpContextAccessor Context;
+        //static DefaultManageProvider()
+        //{
+        //    var ioc = ObjectContainer.Current;
+        //    // 外部管理提供者需要手工覆盖
+        //    ioc.Register<IManageProvider, DefaultManageProvider>();
+        //}
         #endregion
 
         #region 属性
@@ -39,32 +32,22 @@ namespace NewLife.Cube
         public String SessionKey { get; set; } = "Admin";
         #endregion
 
-        /// <summary>当前管理提供者</summary>
-        public new static IManageProvider Provider => ObjectContainer.Current.ResolveInstance<IManageProvider>();
-
         #region IManageProvider 接口
         /// <summary>获取当前用户</summary>
         /// <param name="context"></param>
         /// <returns></returns>
         public override IManageUser GetCurrent(IServiceProvider context = null)
         {
-            var ctx = (context?.GetService<IHttpContextAccessor>() ?? Context)
-                ?.HttpContext;
+#if !__CORE__
+            if (context == null) context = HttpContext.Current;
+            var ss = context.GetService<HttpSessionState>();
+            if (ss == null) return null;
 
-            try
-            {
-                var session = ctx?.Session;
-                var user = ObjectContainer.Current.Resolve<IManageUser>();
-
-                return session?.Get(SessionKey, user.GetType()) as IManageUser;
-            }
-            catch (Exception ex)
-            {
-                // 这里捕获一下，防止初始化应用中seesion还没初始化好报的异常
-                // 这里有个问题就是这里的ctx会有两个不同的值
-                XTrace.WriteException(ex);
-                return null;
-            }
+            // 从Session中获取
+            return ss[SessionKey] as IManageUser;
+#else
+            return null;
+#endif
         }
 
         /// <summary>设置当前用户</summary>
@@ -72,8 +55,9 @@ namespace NewLife.Cube
         /// <param name="context"></param>
         public override void SetCurrent(IManageUser user, IServiceProvider context = null)
         {
-            var ss = ((context)?.GetService<IHttpContextAccessor>() ?? Context)
-                ?.HttpContext.Session;
+#if !__CORE__
+            if (context == null) context = HttpContext.Current;
+            var ss = context.GetService<HttpSessionState>();
             if (ss == null) return;
 
             var key = SessionKey;
@@ -82,8 +66,8 @@ namespace NewLife.Cube
             {
                 // 修改Session
                 ss.Remove(key);
-                // 下线功能暂时失效，通过接口取值报错
-                if (ss.Get<IAuthUser>(key) is IAuthUser au)
+
+                if (ss[key] is IAuthUser au)
                 {
                     au.Online = false;
                     au.Save();
@@ -92,8 +76,10 @@ namespace NewLife.Cube
             else
             {
                 // 修改Session
-                ss.Set(key, user);
+                ss[key] = user;
             }
+#else
+#endif
         }
 
         /// <summary>登录</summary>
@@ -103,14 +89,12 @@ namespace NewLife.Cube
         /// <returns></returns>
         public override IManageUser Login(String name, String password, Boolean rememberme)
         {
-            var user = UserX.Login(name, password, rememberme);
-            Current = user;
+            var user = base.Login(name, password, rememberme);
+            if (user == null) return null;
 
-            var expire = TimeSpan.FromMinutes(0);
+            var expire = TimeSpan.FromDays(0);
             if (rememberme && user != null) expire = TimeSpan.FromDays(365);
-
-            var context = Context?.HttpContext;
-            this.SaveCookie(user, expire, context);
+            this.SaveCookie(user, expire);
 
             return user;
         }
@@ -118,16 +102,18 @@ namespace NewLife.Cube
         /// <summary>注销</summary>
         public override void Logout()
         {
+            base.Logout();
+
+#if !__CORE__
             // 注销时销毁所有Session
-            var context = Context?.HttpContext;
+            var context = HttpContext.Current;
             var ss = context?.Session;
             ss?.Clear();
+#endif
 
             // 销毁Cookie
-            this.SaveCookie(null, TimeSpan.FromDays(-1), context);
-            base.Logout();
+            this.SaveCookie(null, TimeSpan.FromDays(-1));
         }
-
         #endregion
     }
 
@@ -139,8 +125,9 @@ namespace NewLife.Cube
         /// <param name="context">Http上下文，兼容NetCore</param>
         public static void SetPrincipal(this IManageProvider provider, IServiceProvider context = null)
         {
-            var ctx = context.GetService<IHttpContextAccessor>()?.HttpContext;
-            //var ctx = context as HttpContext ?? HttpContext.Current;
+#if !__CORE__
+            //var ctx = context as Microsoft.AspNetCore.Http.HttpContext;
+            var ctx = context as HttpContext ?? HttpContext.Current;
             if (ctx == null) return;
 
             var user = provider.GetCurrent(context);
@@ -155,6 +142,7 @@ namespace NewLife.Cube
             var up = new GenericPrincipal(id, roles.ToArray());
             ctx.User = up;
             Thread.CurrentPrincipal = up;
+#endif
         }
 
         /// <summary>尝试登录。如果Session未登录则借助Cookie</summary>
@@ -180,7 +168,7 @@ namespace NewLife.Cube
         #region Cookie
         private static String GetCookieKey(IManageProvider provider)
         {
-            var key = (provider as ManageProvider2)?.CookieKey;
+            var key = (provider as DefaultManageProvider)?.CookieKey;
             if (key.IsNullOrEmpty()) key = "cube_user";
 
             return key;
@@ -193,15 +181,16 @@ namespace NewLife.Cube
         /// <returns></returns>
         public static IManageUser LoadCookie(this IManageProvider provider, Boolean autologin = true, IServiceProvider context = null)
         {
+#if !__CORE__
             var key = GetCookieKey(provider);
 
-            if (context == null) return null;
-            var req = context.GetService<IHttpContextAccessor>()?.HttpContext?.Request;
+            if (context == null) context = HttpContext.Current;
+            var req = context.GetService<HttpRequest>();
             var cookie = req?.Cookies[key];
             if (cookie == null) return null;
 
             var m = new CookieModel();
-            if (!m.Read(req.Cookies, key, SysConfig.Current.InstallTime.ToFullString())) return null;
+            if (!m.Read(cookie, SysConfig.Current.InstallTime.ToFullString())) return null;
 
             var user = HttpUtility.UrlDecode(m.UserName);
             //var user = HttpUtility.UrlDecode(cookie["u"]);
@@ -227,6 +216,9 @@ namespace NewLife.Cube
             }
 
             return u;
+#else
+            return null;
+#endif
         }
 
         /// <summary>保存用户信息到Cookie</summary>
@@ -234,15 +226,17 @@ namespace NewLife.Cube
         /// <param name="user">用户</param>
         /// <param name="expire">过期时间</param>
         /// <param name="context">Http上下文，兼容NetCore</param>
-        public static void SaveCookie(this IManageProvider provider, IManageUser user, TimeSpan expire, HttpContext context)
+        public static void SaveCookie(this IManageProvider provider, IManageUser user, TimeSpan expire, IServiceProvider context = null)
         {
-            if (context == null) return;
+#if !__CORE__
+            if (context == null) context = HttpContext.Current;
 
-            var req = context.Request;
-            var res = context.Response;
+            var req = context?.GetService<HttpRequest>();
+            var res = context?.GetService<HttpResponse>();
             if (req == null || res == null) return;
 
             var key = GetCookieKey(provider);
+            var reqcookie = req.Cookies[key];
             if (user is IAuthUser au)
             {
                 var u = HttpUtility.UrlEncode(user.Name);
@@ -255,17 +249,18 @@ namespace NewLife.Cube
                     Time = DateTime.Now,
                     Expire = DateTime.Now.Add(expire)
                 };
-                m.Write(res.Cookies, key, SysConfig.Current.InstallTime.ToFullString());
+                m.Write(res.Cookies[key], SysConfig.Current.InstallTime.ToFullString());
             }
             else
             {
-                res.Cookies.Append(key, "", new CookieOptions()
-                {
-                    Expires = DateTime.Now.AddYears(-1)
-                });
+                var cookie = res.Cookies[key];
+                cookie.Value = null;
+                cookie.Expires = DateTime.Now.AddYears(-1);
             }
+#endif
         }
 
+#if !__CORE__
         class CookieModel
         {
             #region 属性
@@ -277,59 +272,40 @@ namespace NewLife.Cube
             #endregion
 
             #region 方法
-            public Boolean Read(IRequestCookieCollection cookie, String cookieKey, String key)
+            public Boolean Read(HttpCookie cookie, String key)
             {
-                var cookies = cookie[cookieKey];
-                var cookieDic = cookies.SplitAsDictionary("=", "&");
-
-                UserName = cookieDic["u"];
-                Password = cookieDic["p"];
-                Time = (cookieDic["t"] + "").ToInt().ToDateTime();
-                Expire = (cookieDic["e"] + "").ToInt().ToDateTime();
-                Sign = cookieDic["s"];
+                UserName = cookie["u"];
+                Password = cookie["p"];
+                Time = (cookie["t"] + "").ToInt().ToDateTime();
+                Expire = (cookie["e"] + "").ToInt().ToDateTime();
+                Sign = cookie["s"];
 
                 var str = $"u={UserName}&p={Password}&t={Time.ToInt()}&e={Expire.ToInt()}&k={key}";
 
                 return str.MD5() == Sign;
             }
 
-            public void Write(IResponseCookies cookie, String cookieKey, String key)
+            public void Write(HttpCookie cookie, String key)
             {
-                var cookieOptions = new CookieOptions
-                {
-                    HttpOnly = true,
-                    Expires = Expire
-                };
+                cookie.HttpOnly = true;
+                cookie["u"] = UserName;
+                cookie["p"] = Password;
+
+                var dt = Time;
+                cookie["t"] = dt.ToInt() + "";
+
+                var exp = Expire;
+                cookie.Expires = exp;
+                cookie["e"] = exp.ToInt() + "";
 
                 var str = $"u={UserName}&p={Password}&t={Time.ToInt()}&e={Expire.ToInt()}&k={key}";
                 Sign = str.MD5();
 
-                str = str + "&s=" + Sign;
-
-                cookie.Append(cookieKey, str, cookieOptions);
+                cookie["s"] = Sign;
             }
             #endregion
         }
+#endif
         #endregion
-
-        /// <summary>
-        /// 添加管理提供者
-        /// </summary>
-        /// <param name="service"></param>
-        public static void AddManageProvider(this IServiceCollection service)
-        {
-            service.TryAddSingleton<IHttpContextAccessor, HttpContextAccessor>();
-            service.TryAddSingleton<IManageProvider, ManageProvider2>();
-            //service.TryAddSingleton(ManageProvider2.Provider);
-        }
-
-        /// <summary>
-        /// 使用管理提供者
-        /// </summary>
-        /// <param name="app"></param>
-        public static void UseManagerProvider(this IApplicationBuilder app)
-        {
-            ManageProvider2.Context = app.ApplicationServices.GetService<IHttpContextAccessor>();
-        }
     }
 }
